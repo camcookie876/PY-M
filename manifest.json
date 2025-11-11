@@ -1,0 +1,8 @@
+{
+  "entry": "main.py",
+  "files": [
+    { "name": "main.py", "sha256": "abc123..." },
+    { "name": "helpers.py", "sha256": "def456..." }
+  ],
+  "requirements": "requirements.txt"
+}
