@@ -1,633 +1,717 @@
-import tkinter as tk
+#!/usr/bin/env python3
+# Camcookie - DIRTBIKES
+# Neon ASCII terminal racer with physics, bots, particles, overlays, and stats.
+# Runs in any terminal; Windows users should install colorama for ANSI support.
+
+import curses
 import time
-import math
+import random
 import json
 import os
+import math
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
 
-# =========================
-# Config
-# =========================
-W, H = 1100, 620
-GROUND_BASE_Y = 470
-GRAVITY = 1500.0
-JUMP_VY = -540.0
-MAX_SPEED = 270.0
-ACCEL = 620.0
-BRAKE = 980.0
-ROLL_DECEL = 720.0
-FRAME_DT = 1/60
-TRACK_LENGTH = 3600.0
+# Optional Windows ANSI support
+try:
+    from colorama import just_fix_windows_console  # type: ignore
+    just_fix_windows_console()
+except Exception:
+    pass
 
-BOT_COUNT_DEFAULT = 3
-COUNTDOWN_MS = 3000
+STATS_FILE = "stats.json"
 
-OBST_ROCKS = 12
-OBST_LOGS = 8
-OBST_RAMPS = 8
+# Game constants
+TRACK_LENGTH = 1200         # world units (columns in world space)
+VIEW_WIDTH_MIN = 60         # min viewport columns
+LANES = 5                   # number of lanes
+GROUND_Y = 0                # ground baseline per lane, vertically stacked
+TICK = 1.0 / 30.0           # seconds per tick (30 FPS)
+GRAVITY = 36.0              # downward accel
+JUMP_VEL = 16.0             # jump impulse
+ACCEL = 28.0                # throttle accel
+BRAKE = 36.0                # brake decel
+FRICTION = 10.0             # passive decel
+MAX_SPEED = 60.0            # cap speed
+ENGINE_ON_ACCEL_FACTOR = 1.0
+ENGINE_OFF_ACCEL_FACTOR = 0.25
 
-STATS_FILE = "dirt_dash_stats.json"
+# Obstacles
+OBSTACLE_DENSITY = 0.008    # spawn per unit per lane
+ROCK = "rock"
+LOG = "log"
+RAMP = "ramp"
 
-# =========================
-# Persisted stats
-# =========================
-def load_stats():
-    try:
-        if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {"total_races": 0, "wins": 0, "best_time": None, "reduced_motion": True, "bots": BOT_COUNT_DEFAULT}
+# Colors (ANSI in curses via color pairs)
+# We'll map logical colors to curses pairs once we know terminal capabilities.
+COLOR_MAP = {
+    "bg": (curses.COLOR_BLACK, curses.COLOR_BLACK),
+    "track": (curses.COLOR_BLACK, curses.COLOR_BLACK),
+    "neon1": (curses.COLOR_BLACK, curses.COLOR_MAGENTA),
+    "neon2": (curses.COLOR_BLACK, curses.COLOR_CYAN),
+    "neon3": (curses.COLOR_BLACK, curses.COLOR_GREEN),
+    "hud": (curses.COLOR_BLACK, curses.COLOR_YELLOW),
+    "danger": (curses.COLOR_BLACK, curses.COLOR_RED),
+    "ghost": (curses.COLOR_BLACK, curses.COLOR_BLUE),
+    "dust": (curses.COLOR_BLACK, curses.COLOR_WHITE),
+    "confetti": (curses.COLOR_BLACK, curses.COLOR_GREEN),
+}
 
-def save_stats(stats):
-    try:
-        with open(STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(stats, f)
-    except Exception:
-        pass
+# Visual characters
+BIKE_PLAYER = "⟲"  # you can swap with 'A' if your font doesn't show this
+BIKE_BOT = "∎"
+GROUND_CHAR = "_"
+ROCK_CHAR = "◼"
+LOG_CHAR = "▭"
+RAMP_CHAR = "⫸"
+SPARK_CHAR = "*"
+DUST_CHAR = "."
+CONFETTI_CHAR = "✺"
 
-stats = load_stats()
+# States
+STATE_HOME = "home"
+STATE_COUNTDOWN = "countdown"
+STATE_RACE = "race"
+STATE_PAUSE = "pause"
+STATE_END = "end"
 
-# =========================
-# Utilities
-# =========================
-def clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
+@dataclass
+class Stats:
+    total_races: int = 0
+    wins: int = 0
+    best_time: Optional[float] = None
 
-def fmt_time(t):
-    if t is None:
-        return "—"
-    m = int(t // 60)
-    s = t - 60 * m
-    return f"{m}:{s:05.2f}"
+    def load(self, path: str = STATS_FILE):
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                    self.total_races = int(data.get("total_races", 0))
+                    self.wins = int(data.get("wins", 0))
+                    bt = data.get("best_time", None)
+                    self.best_time = float(bt) if bt is not None else None
+            except Exception:
+                pass
 
-def seeded_rand(seed):
-    # Simple LCG, returns function that yields [0,1)
-    state = {"x": seed & 0x7fffffff}
-    def rnd():
-        state["x"] = (1103515245 * state["x"] + 12345) & 0x7fffffff
-        return state["x"] / 0x7fffffff
-    return rnd
-
-def ground_y_at(xw):
-    # Gentle slopes for comfort
-    return (GROUND_BASE_Y
-            + 16.0 * math.sin((xw + 200) / 260.0)
-            + 12.0 * math.sin((xw + 900) / 180.0))
-
-# =========================
-# Entities
-# =========================
-class Bike:
-    def __init__(self, color="#FFD166", is_bot=False, name="You"):
-        self.is_bot = is_bot
-        self.name = name
-        self.color = color
-        self.xw = 0.0
-        self.y = ground_y_at(0) - 40
-        self.vy = 0.0
-        self.speed = 0.0
-        self.engine_on = False
-        self.finished = False
-        self.finish_time = None
-        self.bump_cooldown = 0.0
-
-    def on_ground(self):
-        return abs(self.y - (ground_y_at(self.xw) - 36)) < 0.2
-
-    def update_physics(self, dt):
-        self.vy += GRAVITY * dt
-        self.y += self.vy * dt
-        floor = ground_y_at(self.xw) - 36
-        if self.y >= floor:
-            self.y = floor
-            self.vy = 0.0
-        if self.bump_cooldown > 0:
-            self.bump_cooldown -= dt
-
-    def jump(self, vy=JUMP_VY):
-        if self.on_ground():
-            self.vy = vy
-
-class BotAI:
-    def __init__(self, bike, target=220.0, jump_bias=0.0, name="Bot"):
-        self.bike = bike
-        self.target_speed = target
-        self.jump_bias = jump_bias
-        self.name = name
-
-    def step(self, dt, obstacles):
-        b = self.bike
-        if b.finished:
-            return
-        # Maintain target speed
-        if b.speed < self.target_speed:
-            b.speed = min(b.speed + (ACCEL * 0.8) * dt, self.target_speed)
-        else:
-            b.speed = max(b.speed - (ROLL_DECEL * 0.4) * dt, self.target_speed * 0.9)
-        # Look ahead and jump if needed
-        look = 140 + self.jump_bias
-        for ob in obstacles:
-            dx = ob["xw"] - b.xw
-            if 0 < dx < look:
-                if b.on_ground():
-                    if ob["type"] == "ramp":
-                        b.jump(JUMP_VY * 0.95)
-                    else:
-                        b.jump(JUMP_VY * 0.88)
-                break
-        b.xw += b.speed * dt
-        b.update_physics(dt)
-
-# =========================
-# Game
-# =========================
-class Game:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Camcookie Dirt Dash — Race")
-        self.canvas = tk.Canvas(root, width=W, height=H, bg="#1C2537", highlightthickness=0)
-        self.canvas.pack()
-        self.state = "HOME"  # HOME, GRID, PLAY, PAUSE, END
-        self.keys = set()
-        self.world_x = 0.0
-        self.player = Bike()
-        self.bots = []
-        self.bot_ai = []
-        self.time_elapsed = 0.0
-        self.countdown_end = None
-        self.results = []
-        self.bot_count = int(stats.get("bots", BOT_COUNT_DEFAULT))
-        self.reduced_motion = bool(stats.get("reduced_motion", True))
-        self.last_time = time.perf_counter()
-        self.home_buttons = []  # list of (x0,y0,x1,y1, callback, label)
-        self.bind_events()
-        self.start_loop()
-        self.draw_home()
-
-    # -------------
-    # Event binding
-    # -------------
-    def bind_events(self):
-        self.root.bind("<KeyPress>", self.on_keydown)
-        self.root.bind("<KeyRelease>", self.on_keyup)
-        self.canvas.bind("<Button-1>", self.on_click)
-
-    def on_keydown(self, e):
-        self.keys.add(e.keysym)
-        if e.keysym == "space":
-            if self.state == "PLAY":
-                self.player.jump()
-        elif e.keysym.lower() == "s":
-            if self.state in ("GRID", "PLAY", "PAUSE"):
-                self.player.engine_on = not self.player.engine_on
-        elif e.keysym.lower() == "p":
-            self.pause_toggle()
-        elif e.keysym.lower() == "r":
-            if self.state in ("PLAY", "PAUSE", "END"):
-                self.start_race()
-        elif e.keysym == "Return":
-            if self.state == "HOME":
-                self.start_race()
-            elif self.state == "END":
-                self.start_race()
-
-    def on_keyup(self, e):
-        if e.keysym in self.keys:
-            self.keys.remove(e.keysym)
-
-    def on_click(self, e):
-        if self.state == "HOME":
-            for x0, y0, x1, y1, cb, _ in self.home_buttons:
-                if x0 <= e.x <= x1 and y0 <= e.y <= y1:
-                    cb()
-                    break
-        elif self.state == "PAUSE":
-            # simple resume hitbox
-            x0, y0, x1, y1 = self.pause_btn_box
-            if x0 <= e.x <= x1 and y0 <= e.y <= y1:
-                self.pause_toggle()
-
-    # -------------
-    # Loop
-    # -------------
-    def start_loop(self):
-        self.last_time = time.perf_counter()
-        self.root.after(int(1000 * FRAME_DT), self.loop)
-
-    def loop(self):
-        now = time.perf_counter()
-        dt = now - self.last_time
-        self.last_time = now
-        dt = min(dt, 1/30)  # avoid huge steps if window stalls
-
-        if self.state == "PLAY":
-            self.update_play(dt)
-        elif self.state == "GRID":
-            # countdown display only
+    def save(self, path: str = STATS_FILE):
+        try:
+            with open(path, "w") as f:
+                json.dump({
+                    "total_races": self.total_races,
+                    "wins": self.wins,
+                    "best_time": self.best_time
+                }, f)
+        except Exception:
             pass
 
-        self.draw()
-        self.root.after(int(1000 * FRAME_DT), self.loop)
+@dataclass
+class Obstacle:
+    x: float     # world x
+    lane: int
+    kind: str
 
-    # -------------
-    # Flow control
-    # -------------
-    def pause_toggle(self):
-        if self.state == "PLAY":
-            self.state = "PAUSE"
-        elif self.state == "PAUSE":
-            self.state = "PLAY"
+@dataclass
+class Particle:
+    x: float
+    y: float
+    vx: float
+    vy: float
+    ttl: float
+    char: str
+    color_key: str
 
-    def to_home(self):
-        stats["bots"] = self.bot_count
-        stats["reduced_motion"] = self.reduced_motion
-        save_stats(stats)
-        self.state = "HOME"
-        self.draw_home()
+@dataclass
+class Racer:
+    name: str
+    is_player: bool
+    lane: int
+    x: float = 0.0
+    y: float = 0.0            # vertical offset above ground
+    vx: float = 0.0
+    vy: float = 0.0
+    finished: bool = False
+    finish_time: Optional[float] = None
+    engine_on: bool = True
+    sparks_cooldown: float = 0.0
 
-    def start_race(self):
-        self.state = "GRID"
-        self.results = []
-        self.time_elapsed = 0.0
-        self.world_x = 0.0
-        self.player = Bike()
-        self.player.engine_on = False
-        self.spawn_obstacles()
-        self.build_bots()
-        self.countdown_end = time.perf_counter() + (COUNTDOWN_MS/1000.0)
+    # Bot AI params
+    target_speed: float = field(default_factory=lambda: random.uniform(32.0, 52.0))
+    lookahead: float = field(default_factory=lambda: random.uniform(10.0, 24.0))
+    jump_bias: float = field(default_factory=lambda: random.uniform(0.35, 0.75))
 
-    def build_bots(self):
-        self.bots = []
-        self.bot_ai = []
-        colors = ["#93C5FD", "#86EFAC", "#FCA5A5", "#F0ABFC", "#FDE68A"]
-        for i in range(self.bot_count):
-            b = Bike(color=colors[i % len(colors)], is_bot=True, name=f"Bot {i+1}")
-            self.bots.append(b)
-            ai = BotAI(b, target=220.0 + 12*i, jump_bias=10*i, name=b.name)
-            self.bot_ai.append(ai)
+class Track:
+    def __init__(self, length: int, lanes: int):
+        self.length = length
+        self.lanes = lanes
+        self.obstacles: List[Obstacle] = []
+        self.generate()
 
-    # -------------
-    # Track and obstacles
-    # -------------
-    def spawn_obstacles(self):
-        self.obstacles = []
-        rnd = seeded_rand(1337)
-        # rocks
-        for n in range(OBST_ROCKS):
-            xw = 240 + (TRACK_LENGTH - 480) * (n + 1) / (OBST_ROCKS + 1) + int(rnd()*53) - 26
-            r = 10 + (n * 31) % 7
-            self.obstacles.append({"type": "rock", "xw": xw, "r": r})
-        # logs
-        for n in range(OBST_LOGS):
-            xw = 400 + (TRACK_LENGTH - 800) * (n + 1) / (OBST_LOGS + 1) + int(rnd()*73) - 36
-            w = 56 + (n * 13) % 16
-            h = 12
-            self.obstacles.append({"type": "log", "xw": xw, "w": w, "h": h})
-        # ramps
-        for n in range(OBST_RAMPS):
-            xw = 350 + (TRACK_LENGTH - 700) * (n + 1) / (OBST_RAMPS + 1) + int(rnd()*61) - 30
-            w = 84
-            h = 40
-            self.obstacles.append({"type": "ramp", "xw": xw, "w": w, "h": h})
-        self.obstacles.sort(key=lambda o: o["xw"])
-
-    # -------------
-    # Update
-    # -------------
-    def update_play(self, dt):
-        # Engine and input
-        if not self.player.engine_on:
-            self.player.speed = max(0.0, self.player.speed - ROLL_DECEL * dt)
-        else:
-            if "Right" in self.keys:
-                self.player.speed = clamp(self.player.speed + ACCEL * dt, 0, MAX_SPEED)
-            elif "Left" in self.keys:
-                self.player.speed = clamp(self.player.speed - BRAKE * dt, 0, MAX_SPEED)
-            else:
-                self.player.speed = clamp(self.player.speed - ROLL_DECEL * dt, 0, MAX_SPEED)
-
-        # Advance world
-        self.player.xw += self.player.speed * dt
-        self.player.update_physics(dt)
-
-        # Bots
-        for ai in self.bot_ai:
-            ai.step(dt, self.obstacles)
-
-        # Obstacle interaction (player)
-        self.handle_obstacles(self.player)
-
-        # Finish check
-        everyone = [self.player] + self.bots
-        for b in everyone:
-            if (not b.finished) and b.xw >= TRACK_LENGTH:
-                b.finished = True
-                b.finish_time = self.time_elapsed
-
-        # Race finished?
-        if all(b.finished or b.xw >= TRACK_LENGTH for b in everyone):
-            self.end_race()
-
-        # Timer
-        self.time_elapsed += dt
-
-    def handle_obstacles(self, bike):
-        # simple collisions/jumps
-        for ob in self.obstacles:
-            dx = ob["xw"] - bike.xw
-            if -30 <= dx <= 30:
-                gy = ground_y_at(ob["xw"])
-                if ob["type"] == "rock":
-                    top = gy - ob["r"]
-                    if bike.y >= top - 10 and bike.bump_cooldown <= 0:
-                        bike.speed = max(bike.speed * 0.6, bike.speed - 80)
-                        bike.vy = -120
-                        bike.bump_cooldown = 0.6
-                elif ob["type"] == "log":
-                    top = gy - ob["h"]
-                    if bike.y >= top - 10 and bike.bump_cooldown <= 0:
-                        bike.speed = max(bike.speed * 0.7, bike.speed - 90)
-                        bike.vy = -150
-                        bike.bump_cooldown = 0.6
-                else:  # ramp, give a lift if on ground and at ramp mouth
-                    mouth_left = ob["xw"] - ob["w"] / 2
-                    mouth_right = ob["xw"] + ob["w"] / 2
-                    if mouth_left - 10 <= bike.xw <= mouth_right + 10 and bike.on_ground():
-                        bike.vy = JUMP_VY * 0.9  # gentle ramp jump
-
-    def end_race(self):
-        # gather results (sort by finish_time)
-        everyone = []
-        for b in [self.player] + self.bots:
-            t = b.finish_time if b.finish_time is not None else self.time_elapsed
-            everyone.append((b.name, t))
-        everyone.sort(key=lambda t: t[1])
-        self.results = everyone
-
-        # update stats
-        stats["total_races"] = stats.get("total_races", 0) + 1
-        # is player first?
-        if len(everyone) > 0 and everyone[0][0] == "You":
-            stats["wins"] = stats.get("wins", 0) + 1
-        # best time
-        pt = next((t for n, t in everyone if n == "You"), None)
-        if pt is not None:
-            bt = stats.get("best_time", None)
-            if (bt is None) or (pt < bt):
-                stats["best_time"] = pt
-        stats["bots"] = self.bot_count
-        stats["reduced_motion"] = self.reduced_motion
-        save_stats(stats)
-
-        self.state = "END"
-
-    # -------------
-    # Draw
-    # -------------
-    def draw(self):
-        self.canvas.delete("all")
-        # Background
-        self.draw_background()
-        # Ground and level
-        self.draw_ground()
-        self.draw_finish_start()
-        self.draw_obstacles()
-
-        # Entities
-        self.draw_player()
-        self.draw_bots()
-
-        # HUD and overlays
-        self.draw_hud()
-
-        if self.state == "HOME":
-            self.draw_home_overlay()
-        elif self.state == "GRID":
-            self.draw_grid_overlay()
-        elif self.state == "PAUSE":
-            self.draw_pause_overlay()
-        elif self.state == "END":
-            self.draw_end_overlay()
-
-    def draw_background(self):
-        # sky is canvas background
-        # parallax bands
-        par = 0.15 if self.reduced_motion else 0.3
-        off1 = -((self.world_x * par) % W)
-        off2 = -((self.world_x * par * 1.4) % W)
-        y1 = H - 260
-        y2 = H - 200
-        self.canvas.create_rectangle(off1, y1, off1 + W * 2, H, fill="#1B2438", width=0)
-        self.canvas.create_rectangle(off2, y2, off2 + W * 2, H, fill="#162034", width=0)
-        # stands strip
-        self.canvas.create_rectangle(0, H - 150, W, H - 90, fill="#121A2A", width=0)
-
-    def draw_ground(self):
-        # camera scroll
-        target_x = self.player.xw
-        # ease world_x toward player x to reduce motion (smoother camera)
-        self.world_x += (target_x - self.world_x) * (0.12 if self.reduced_motion else 0.2)
-
-        step = 8
-        pts = []
-        for sx in range(0, W + step, step):
-            xw = self.world_x + sx
-            y = ground_y_at(xw)
-            pts.append((sx, y))
-        # close polygon to bottom
-        poly = []
-        for (x, y) in pts:
-            poly.extend([x, y])
-        poly.extend([W, H, 0, H])
-        self.canvas.create_polygon(*poly, fill="#2C3A4F", outline="#192235")
-
-    def draw_finish_start(self):
-        # finish
-        fx = TRACK_LENGTH - self.world_x
-        if -50 <= fx <= W + 50:
-            self.canvas.create_rectangle(fx, H - 320, fx + 6, H, fill="#0EA5E9", width=0)
-            # checker
-            for r in range(3):
-                for c in range(3):
-                    if (r + c) % 2 == 0:
-                        x0 = fx + 6 + c * 8
-                        y0 = H - 320 + r * 8
-                        self.canvas.create_rectangle(x0, y0, x0 + 8, y0 + 8, fill="#111827", width=0)
-        # start
-        sx = 0 - self.world_x
-        if -50 <= sx <= W + 50:
-            self.canvas.create_rectangle(sx, H - 320, sx + 6, H, fill="#10B981", width=0)
-            self.canvas.create_rectangle(sx + 6, H - 320, sx + 6 + 70, H - 298, fill="#22D3EE", width=0)
-
-    def draw_obstacles(self):
-        for ob in self.obstacles:
-            x = ob["xw"] - self.world_x
-            y = ground_y_at(ob["xw"])
-            if -100 <= x <= W + 100:
-                if ob["type"] == "rock":
-                    r = ob["r"]
-                    self.canvas.create_oval(x - r, y - 2 * r, x + r, y, fill="#7DD3FC", outline="#0EA5E9", width=2)
-                elif ob["type"] == "log":
-                    w = ob["w"]; h = ob["h"]
-                    self.canvas.create_rectangle(x - w/2, y - h, x + w/2, y, fill="#A78B6A", outline="#6B4F33", width=2)
+    def generate(self):
+        self.obstacles.clear()
+        for lane in range(self.lanes):
+            x = 20
+            while x < self.length - 60:
+                if random.random() < OBSTACLE_DENSITY:
+                    kind = random.choice([ROCK, LOG, RAMP, ROCK, LOG])
+                    self.obstacles.append(Obstacle(x=x, lane=lane, kind=kind))
+                    x += random.randint(12, 28)
                 else:
-                    w = ob["w"]; h = ob["h"]
-                    # ramp triangle
-                    self.canvas.create_polygon(x - w/2, y, x + w/2, y, x - w/2, y - h,
-                                               fill="#9CA3AF", outline="#6B7280", width=2)
+                    x += random.randint(4, 12)
 
-    def draw_player(self):
-        # player drawn as bike rectangle + wheels
-        sx = (self.player.xw - self.world_x) + 220
-        sy = self.player.y
-        # body
-        self.canvas.create_rectangle(sx - 30, sy - 12, sx + 32, sy + 6, fill=self.player.color, outline="#2B2D42", width=2)
-        # wheels
-        self.canvas.create_oval(sx - 30 - 12, sy + 6, sx - 30 + 12, sy + 30, outline="#F8FAFC", width=3)
-        self.canvas.create_oval(sx + 20 - 12, sy + 6, sx + 20 + 12, sy + 30, outline="#F8FAFC", width=3)
-        # rider head
-        self.canvas.create_oval(sx - 2 - 6, sy - 12 - 6, sx - 2 + 6, sy - 12 + 6, fill="#E11D48", width=0)
+    def obstacles_in_lane(self, lane: int) -> List[Obstacle]:
+        return [o for o in self.obstacles if o.lane == lane]
 
-    def draw_bots(self):
-        for b in self.bots:
-            sx = (b.xw - self.world_x) + 220
-            sy = b.y
-            self.canvas.create_rectangle(sx - 30, sy - 12, sx + 32, sy + 6, fill=b.color, outline="#0F172A", width=2)
-            self.canvas.create_oval(sx - 42, sy + 6, sx - 18, sy + 30, outline="#E5E7EB", width=2)
-            self.canvas.create_oval(sx + 8, sy + 6, sx + 32, sy + 30, outline="#E5E7EB", width=2)
-            self.canvas.create_oval(sx - 2 - 6, sy - 12 - 6, sx - 2 + 6, sy - 12 + 6, fill="#334155", width=0)
+class Game:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        curses.curs_set(0)
+        self.h, self.w = stdscr.getmaxyx()
+        self.w = max(self.w, VIEW_WIDTH_MIN)
+        curses.start_color()
+        curses.use_default_colors()
+        self._init_color_pairs()
 
-    def draw_hud(self):
-        # bg
-        self.canvas.create_rectangle(12, 12, 12 + 460, 12 + 92, fill="#00000059", outline="", width=0)
-        # time
-        self.canvas.create_text(24, 36, anchor="w", fill="#E5E7EB", font=("Segoe UI", 14),
-                                text=f"Time {fmt_time(self.time_elapsed)}")
-        # speed
-        self.canvas.create_text(24, 60, anchor="w", fill="#E5E7EB", font=("Segoe UI", 12),
-                                text=f"Speed {int(self.player.speed)}")
-        # position
-        everyone = [("You", self.player.xw)] + [(b.name, b.xw) for b in self.bots]
-        everyone.sort(key=lambda t: -t[1])
-        pos = next((i+1 for i, (n, _) in enumerate(everyone) if n == "You"), 1)
-        self.canvas.create_text(160, 60, anchor="w", fill="#E5E7EB", font=("Segoe UI", 12),
-                                text=f"Pos {pos}/{len(everyone)}")
-        # hint
-        self.canvas.create_text(320, 60, anchor="w", fill="#CBD5E1", font=("Segoe UI", 10),
-                                text="S engine | → throttle | ← brake")
-        # status strip
-        self.canvas.create_text(12, H - 12, anchor="sw", fill="#CBD5E1", font=("Segoe UI", 10),
-                                text=f"State: {self.state}   Engine: {'ON' if self.player.engine_on else 'OFF'}   Reduced motion: {'ON' if self.reduced_motion else 'OFF'}   Bots: {self.bot_count}")
+        self.state = STATE_HOME
+        self.stats = Stats()
+        self.stats.load()
 
-    # -------------
-    # Overlays
-    # -------------
-    def draw_home(self):
-        self.canvas.delete("all")
-        self.draw_background()
-        self.draw_ground()
-        self.home_buttons = []
-        # panel
-        x, y, w, h = 320, 140, 480, 300
-        self.canvas.create_rectangle(x, y, x + w, y + h, fill="#0000008C", outline="#0EA5E9", width=2)
-        self.canvas.create_text(x + 30, y + 40, anchor="w", fill="#F8FAFC", font=("Segoe UI", 22, "bold"),
-                                text="Race Setup")
-        best = fmt_time(stats.get("best_time"))
-        races = stats.get("total_races", 0)
-        wins = stats.get("wins", 0)
-        self.canvas.create_text(x + 30, y + 70, anchor="w", fill="#CBD5E1", font=("Segoe UI", 12),
-                                text=f"Best: {best}   Races: {races}   Wins: {wins}")
+        self.bot_count = 4
+        self.reduced_motion = False
 
-        # Bots control
-        self.canvas.create_text(x + 30, y + 100, anchor="w", fill="#E5E7EB", font=("Segoe UI", 12),
-                                text=f"Bots: {self.bot_count}")
-        # buttons
-        def button(rx, ry, rw, rh, label, cb):
-            self.canvas.create_rectangle(rx, ry, rx + rw, ry + rh, fill="#FFD166", outline="", width=0)
-            self.canvas.create_text(rx + rw/2, ry + rh/2, fill="#1F2937", font=("Segoe UI", 12, "bold"), text=label)
-            self.home_buttons.append((rx, ry, rx + rw, ry + rh, cb, label))
+        self.track = Track(TRACK_LENGTH, LANES)
+        self.racers: List[Racer] = []
+        self.particles: List[Particle] = []
+        self.camera_x = 0.0
+        self.time_race = 0.0
+        self.time_start_countdown = 0.0
+        self.countdown_phase = 0  # 3,2,1,GO
 
-        button(x + 140, y + 90, 28, 28, "-", self.dec_bots)
-        button(x + 174, y + 90, 28, 28, "+", self.inc_bots)
+    def _init_color_pairs(self):
+        self.color_pairs = {}
+        pair_id = 1
+        for key, (fg, bg) in COLOR_MAP.items():
+            curses.init_pair(pair_id, bg, fg)  # reverse to make neon foreground bright bg effect
+            self.color_pairs[key] = pair_id
+            pair_id += 1
 
-        # Reduced motion toggle
-        label_rm = "Reduced Motion: ON" if self.reduced_motion else "Reduced Motion: OFF"
-        button(x + 30, y + 130, 210, 34, label_rm, self.toggle_rm)
+    def run(self):
+        last = time.time()
+        while True:
+            now = time.time()
+            dt = max(0.001, min(0.06, now - last))
+            last = now
 
-        # Start
-        button(x + 30, y + 180, 160, 38, "Start Race (Enter)", self.start_race)
+            self._handle_input()
 
-        # Static showcase
-        self.world_x = 120.0
-        self.draw()
+            if self.state == STATE_HOME:
+                self._render_home()
+            elif self.state == STATE_COUNTDOWN:
+                self._update_countdown(dt)
+                self._render_countdown()
+            elif self.state == STATE_RACE:
+                self._update_race(dt)
+                self._render_race()
+            elif self.state == STATE_PAUSE:
+                self._render_pause()
+            elif self.state == STATE_END:
+                self._render_end()
 
-    def draw_home_overlay(self):
-        # Buttons already drawn in draw_home()
-        pass
+            time.sleep(max(0.0, TICK - (time.time() - now)))
 
-    def draw_grid_overlay(self):
-        # Countdown
-        ms_left = int(max(0, (self.countdown_end - time.perf_counter()) * 1000))
-        if ms_left == 0 and self.state == "GRID":
-            self.state = "PLAY"
-            self.player.engine_on = True  # auto on when race starts
-        # big numbers
-        if self.state == "GRID":
-            sec = ms_left // 1000
-            disp = "3" if sec >= 2 else "2" if sec >= 1 else "1" if ms_left > 0 else "GO"
-            self.canvas.create_text(W/2, H/2 - 60, fill="#FDE68A", font=("Segoe UI", 54, "bold"), text=disp)
+    # Input handling
+    def _handle_input(self):
+        self.stdscr.nodelay(True)
+        try:
+            ch = self.stdscr.getch()
+        except Exception:
+            ch = -1
 
-    def draw_pause_overlay(self):
-        # panel with resume button
-        x, y, w, h = 400, 220, 300, 140
-        self.canvas.create_rectangle(x, y, x + w, y + h, fill="#0000008C", outline="#0EA5E9", width=2)
-        self.canvas.create_text(x + w/2, y + 40, fill="#F3F4F6", font=("Segoe UI", 20, "bold"), text="Paused")
-        # resume button
-        rx, ry, rw, rh = x + 50, y + 70, 200, 34
-        self.canvas.create_rectangle(rx, ry, rx + rw, ry + rh, fill="#FFD166", outline="", width=0)
-        self.canvas.create_text(rx + rw/2, ry + rh/2, fill="#1F2937", font=("Segoe UI", 12, "bold"), text="Resume (P)")
-        self.pause_btn_box = (rx, ry, rx + rw, ry + rh)
+        if ch == -1:
+            return
 
-    def draw_end_overlay(self):
-        x, y, w, h = 260, 120, 560, 320
-        self.canvas.create_rectangle(x, y, x + w, y + h, fill="#0000008C", outline="#0EA5E9", width=2)
-        self.canvas.create_text(x + 20, y + 40, anchor="w", fill="#F8FAFC", font=("Segoe UI", 22, "bold"),
-                                text="Race Results")
-        yy = y + 70
-        pos = 1
-        for name, t in self.results:
-            self.canvas.create_text(x + 20, yy, anchor="w", fill="#E5E7EB", font=("Segoe UI", 12),
-                                    text=f"{pos}. {name} — {fmt_time(t)}")
-            yy += 24
-            pos += 1
-        # buttons
-        def draw_btn(bx, by, bw, bh, label, cb):
-            self.canvas.create_rectangle(bx, by, bx + bw, by + bh, fill="#FFD166", outline="", width=0)
-            self.canvas.create_text(bx + bw/2, by + bh/2, fill="#1F2937", font=("Segoe UI", 12, "bold"), text=label)
-            self.home_buttons.append((bx, by, bx + bw, by + bh, cb, label))
-        # reuse simple click system
-        self.home_buttons = []
-        draw_btn(x + 20, yy + 10, 160, 36, "Race Again (R)", self.start_race)
-        draw_btn(x + 200, yy + 10, 120, 36, "Home", self.to_home)
+        if self.state == STATE_HOME:
+            if ch in (ord('\n'), curses.KEY_ENTER):
+                self._start_countdown()
+            elif ch in (ord('+'),):
+                self.bot_count = min(12, self.bot_count + 1)
+            elif ch in (ord('-'),):
+                self.bot_count = max(0, self.bot_count - 1)
+            elif ch in (ord('m'), ord('M')):
+                self.reduced_motion = not self.reduced_motion
+            elif ch in (ord('q'), ord('Q')):
+                raise SystemExit
 
-    # -------------
-    # Home actions
-    # -------------
-    def dec_bots(self):
-        self.bot_count = max(0, self.bot_count - 1)
-        self.draw_home()
+        elif self.state == STATE_COUNTDOWN:
+            if ch in (ord('q'), ord('Q')):
+                raise SystemExit
+            # allow early pause
+            if ch in (ord('p'), ord('P')):
+                self.state = STATE_PAUSE
 
-    def inc_bots(self):
-        self.bot_count = min(5, self.bot_count + 1)
-        self.draw_home()
+        elif self.state == STATE_RACE:
+            player = self._player()
+            if ch in (ord('q'), ord('Q')):
+                raise SystemExit
+            elif ch in (ord('p'), ord('P')):
+                self.state = STATE_PAUSE
+            elif ch in (ord('r'), ord('R')):
+                self._rematch()
+            elif ch in (ord('h'), ord('H')):
+                self._to_home()
+            elif ch in (ord('m'), ord('M')):
+                self.reduced_motion = not self.reduced_motion
+            elif ch in (ord('s'), ord('S')):
+                player.engine_on = not player.engine_on
+            elif ch in (ord('d'), ord('D')):
+                # throttle pressed: handled in update via a flag? We'll nudge vx
+                accel = ACCEL * (ENGINE_ON_ACCEL_FACTOR if player.engine_on else ENGINE_OFF_ACCEL_FACTOR)
+                player.vx = min(MAX_SPEED, player.vx + accel * 0.06)
+                self._dust(player)
+            elif ch in (ord('a'), ord('A')):
+                player.vx = max(0.0, player.vx - BRAKE * 0.08)
+            elif ch == ord(' '):
+                if abs(player.y) < 0.001:
+                    player.vy = JUMP_VEL
+                    self._dust(player, strong=True)
 
-    def toggle_rm(self):
-        self.reduced_motion = not self.reduced_motion
-        self.draw_home()
+        elif self.state == STATE_PAUSE:
+            if ch in (ord('p'), ord('P')):
+                self.state = STATE_RACE
+            elif ch in (ord('h'), ord('H')):
+                self._to_home()
+            elif ch in (ord('q'), ord('Q')):
+                raise SystemExit
+            elif ch in (ord('r'), ord('R')):
+                self._rematch()
 
+        elif self.state == STATE_END:
+            if ch in (ord('\n'), curses.KEY_ENTER):
+                self._rematch()
+            elif ch in (ord('h'), ord('H')):
+                self._to_home()
+            elif ch in (ord('q'), ord('Q')):
+                raise SystemExit
+
+    # State transitions
+    def _start_countdown(self):
+        self.time_start_countdown = time.time()
+        self.countdown_phase = 3
+        self._spawn_race()
+        self.state = STATE_COUNTDOWN
+
+    def _spawn_race(self):
+        self.track.generate()
+        self.racers = []
+        # place player in middle lane
+        player_lane = LANES // 2
+        self.racers.append(Racer(name="YOU", is_player=True, lane=player_lane))
+        # bots
+        for i in range(self.bot_count):
+            lane = i % LANES
+            self.racers.append(Racer(name=f"BOT-{i+1}", is_player=False, lane=lane))
+        for r in self.racers:
+            r.x = 0.0
+            r.y = 0.0
+            r.vx = 0.0
+            r.vy = 0.0
+            r.finished = False
+            r.finish_time = None
+            r.engine_on = True
+        self.particles.clear()
+        self.camera_x = 0.0
+        self.time_race = 0.0
+
+    def _rematch(self):
+        self._start_countdown()
+
+    def _to_home(self):
+        self.state = STATE_HOME
+
+    # Updates
+    def _update_countdown(self, dt):
+        elapsed = time.time() - self.time_start_countdown
+        if elapsed < 1.0:
+            self.countdown_phase = 3
+        elif elapsed < 2.0:
+            self.countdown_phase = 2
+        elif elapsed < 3.0:
+            self.countdown_phase = 1
+        elif elapsed < 3.6:
+            self.countdown_phase = 0  # GO flash
+        else:
+            self.state = STATE_RACE
+
+    def _update_race(self, dt):
+        self.time_race += dt
+        # Physics and AI for each racer
+        for r in self.racers:
+            if r.finished:
+                continue
+
+            if r.is_player:
+                # passive friction
+                if r.vx > 0:
+                    r.vx = max(0.0, r.vx - FRICTION * dt)
+            else:
+                self._bot_ai(r, dt)
+
+            # gravity
+            r.vy -= GRAVITY * dt
+            r.y += r.vy * dt
+            if r.y <= 0.0:
+                r.y = 0.0
+                r.vy = 0.0
+
+            # speed clamp
+            r.vx = max(0.0, min(MAX_SPEED, r.vx))
+            r.x += r.vx * dt
+
+            # collisions
+            self._collisions(r, dt)
+
+            # finish check
+            if r.x >= TRACK_LENGTH:
+                r.finished = True
+                r.finish_time = self.time_race
+                if r.is_player:
+                    self._confetti_burst(r)
+
+        # camera
+        px = self._player().x
+        target_cam = px - (self.w // 3)
+        if self.reduced_motion:
+            self.camera_x = max(0.0, min(TRACK_LENGTH, target_cam))
+        else:
+            self.camera_x = self._lerp(self.camera_x, target_cam, 0.12)
+
+        # particles
+        self._update_particles(dt)
+
+        # all finished?
+        if all(r.finished for r in self.racers):
+            self._race_end()
+
+    def _bot_ai(self, r: Racer, dt: float):
+        # maintain target speed; slight variance
+        accel = ACCEL if r.engine_on else ACCEL * ENGINE_OFF_ACCEL_FACTOR
+        if r.vx < r.target_speed:
+            r.vx = min(MAX_SPEED, r.vx + accel * dt)
+        else:
+            r.vx = max(0.0, r.vx - FRICTION * dt)
+
+        # lookahead for obstacles
+        ahead = r.x + r.lookahead
+        lane_obs = self.track.obstacles_in_lane(r.lane)
+        hazard = None
+        for o in lane_obs:
+            if r.x < o.x <= ahead:
+                hazard = o
+                break
+        if hazard:
+            # prefer jumping ramps; avoid rocks/logs
+            jump_chance = r.jump_bias
+            if hazard.kind == RAMP:
+                jump_chance = max(0.65, jump_chance + 0.2)
+            if r.y <= 0.001 and random.random() < jump_chance:
+                r.vy = JUMP_VEL * random.uniform(0.9, 1.1)
+                self._dust(r)
+            # slight braking near hazard
+            r.vx = max(0.0, r.vx - BRAKE * 0.2 * dt)
+
+    def _collisions(self, r: Racer, dt: float):
+        if r.y > 0.0:
+            return
+        lane_obs = self.track.obstacles_in_lane(r.lane)
+        for o in lane_obs:
+            if abs(r.x - o.x) < 0.9:
+                if o.kind == ROCK:
+                    r.vx = max(0.0, r.vx - 12.0)
+                    self._sparks(r, count=random.randint(2, 5))
+                elif o.kind == LOG:
+                    r.vx = max(0.0, r.vx - 9.0)
+                    self._sparks(r, count=random.randint(1, 4))
+                elif o.kind == RAMP:
+                    if r.y <= 0.001:
+                        r.vy = JUMP_VEL * 1.2
+                        self._dust(r, strong=True)
+
+    def _race_end(self):
+        # update stats, sort results, confetti for player if win
+        self.state = STATE_END
+        self.stats.total_races += 1
+        # best time update if player finished
+        player = self._player()
+        if player.finish_time is not None:
+            if self.stats.best_time is None or player.finish_time < self.stats.best_time:
+                self.stats.best_time = player.finish_time
+        # win check
+        ordered = sorted(self.racers, key=lambda r: r.finish_time if r.finish_time is not None else 9e9)
+        if ordered and ordered[0].is_player:
+            self.stats.wins += 1
+        self.stats.save()
+
+    # Particles
+    def _dust(self, r: Racer, strong: bool = False):
+        n = random.randint(2, 5) + (4 if strong else 0)
+        for _ in range(n):
+            self.particles.append(Particle(
+                x=r.x - random.uniform(0.5, 2.0),
+                y=0.0,
+                vx=-random.uniform(8.0, 16.0),
+                vy=random.uniform(0.5, 2.0),
+                ttl=random.uniform(0.2, 0.6),
+                char=DUST_CHAR,
+                color_key="dust"
+            ))
+
+    def _sparks(self, r: Racer, count: int = 3):
+        if r.sparks_cooldown > 0.0:
+            return
+        r.sparks_cooldown = 0.2
+        for _ in range(count):
+            self.particles.append(Particle(
+                x=r.x + random.uniform(-0.3, 0.3),
+                y=0.2,
+                vx=random.uniform(-6.0, 6.0),
+                vy=random.uniform(2.0, 5.0),
+                ttl=random.uniform(0.2, 0.5),
+                char=SPARK_CHAR,
+                color_key="danger"
+            ))
+
+    def _confetti_burst(self, r: Racer):
+        for _ in range(25):
+            self.particles.append(Particle(
+                x=r.x,
+                y=1.0,
+                vx=random.uniform(-10.0, 10.0),
+                vy=random.uniform(2.0, 8.0),
+                ttl=random.uniform(0.4, 1.2),
+                char=CONFETTI_CHAR,
+                color_key=random.choice(["neon1", "neon2", "neon3", "confetti"])
+            ))
+
+    def _update_particles(self, dt: float):
+        alive = []
+        for p in self.particles:
+            p.ttl -= dt
+            if p.ttl <= 0:
+                continue
+            p.vy -= GRAVITY * 0.3 * dt
+            p.x += p.vx * dt
+            p.y = max(0.0, p.y + p.vy * dt)
+            alive.append(p)
+        self.particles = alive
+        # cooldowns
+        for r in self.racers:
+            if r.sparks_cooldown > 0.0:
+                r.sparks_cooldown = max(0.0, r.sparks_cooldown - dt)
+
+    # Rendering helpers
+    def _clr(self, key: str):
+        return curses.color_pair(self.color_pairs.get(key, 0))
+
+    def _render_home(self):
+        self.stdscr.erase()
+        midx = self.w // 2
+
+        title = "Camcookie - DIRTBIKES"
+        self.stdscr.attron(self._clr("neon2"))
+        self._center_text(2, title)
+        self.stdscr.attroff(self._clr("neon2"))
+
+        self.stdscr.attron(self._clr("hud"))
+        self._center_text(4, "Fast-paced neon ASCII dirt racing in your terminal.")
+        self.stdscr.attroff(self._clr("hud"))
+
+        # Stats
+        s1 = f"Total races: {self.stats.total_races}"
+        s2 = f"Wins: {self.stats.wins}"
+        s3 = f"Best time: {self._fmt_time(self.stats.best_time) if self.stats.best_time else '--'}"
+        self._center_text(6, s1)
+        self._center_text(7, s2)
+        self._center_text(8, s3)
+
+        # Config
+        self.stdscr.attron(self._clr("neon1"))
+        self._center_text(10, f"Bots: {self.bot_count}   (+ / - to adjust)")
+        self.stdscr.attroff(self._clr("neon1"))
+        self.stdscr.attron(self._clr("neon3"))
+        self._center_text(11, f"Reduced motion: {'ON' if self.reduced_motion else 'OFF'}   (M to toggle)")
+        self.stdscr.attroff(self._clr("neon3"))
+
+        self.stdscr.attron(self._clr("hud"))
+        self._center_text(13, "Enter — Start   Q — Quit")
+        self.stdscr.attroff(self._clr("hud"))
+
+        self.stdscr.refresh()
+
+    def _render_countdown(self):
+        self.stdscr.erase()
+        self._draw_track_base()
+        self._draw_racers()
+        self._draw_particles()
+
+        msg = "3" if self.countdown_phase == 3 else "2" if self.countdown_phase == 2 else "1" if self.countdown_phase == 1 else "GO!"
+        color = "danger" if self.countdown_phase in [3, 2, 1] else "neon3"
+        self.stdscr.attron(self._clr(color))
+        self._center_text(2, msg)
+        self.stdscr.attroff(self._clr(color))
+
+        self._draw_hud()
+        self.stdscr.refresh()
+
+    def _render_race(self):
+        self.stdscr.erase()
+        self._draw_track_base()
+        self._draw_obstacles()
+        self._draw_racers()
+        self._draw_particles()
+        self._draw_hud()
+        self.stdscr.refresh()
+
+    def _render_pause(self):
+        self.stdscr.erase()
+        self._draw_track_base()
+        self._draw_obstacles()
+        self._draw_racers()
+        self._draw_particles()
+        self._draw_hud()
+        # Overlay
+        self.stdscr.attron(self._clr("ghost"))
+        self._center_text(3, "[PAUSED]")
+        self._center_text(5, "P — Resume    R — Restart    H — Home")
+        self.stdscr.attroff(self._clr("ghost"))
+        self.stdscr.refresh()
+
+    def _render_end(self):
+        self.stdscr.erase()
+        # Results sorted by time
+        ordered = sorted(self.racers, key=lambda r: r.finish_time if r.finish_time is not None else 9e9)
+        self.stdscr.attron(self._clr("neon2"))
+        self._center_text(2, "Race Results")
+        self.stdscr.attroff(self._clr("neon2"))
+
+        y = 4
+        for i, r in enumerate(ordered[:self.h - 10]):
+            name = r.name if not r.is_player else "YOU"
+            t = self._fmt_time(r.finish_time)
+            line = f"{i+1:>2}. {name:<8}  time: {t:<10}"
+            color = "neon3" if r.is_player else "hud"
+            self.stdscr.attron(self._clr(color))
+            self._center_text(y, line)
+            self.stdscr.attroff(self._clr(color))
+            y += 1
+
+        self.stdscr.attron(self._clr("neon1"))
+        self._center_text(y + 1, f"Total races: {self.stats.total_races}   Wins: {self.stats.wins}   Best: {self._fmt_time(self.stats.best_time) if self.stats.best_time else '--'}")
+        self.stdscr.attroff(self._clr("neon1"))
+
+        self.stdscr.attron(self._clr("hud"))
+        self._center_text(y + 3, "Enter — Rematch    H — Home")
+        self.stdscr.attroff(self._clr("hud"))
+
+        self.stdscr.refresh()
+
+    # Drawing primitives
+    def _draw_track_base(self):
+        # Draw lanes as ground lines with subtle neon
+        for lane in range(LANES):
+            row = min(self.h - 3, 6 + lane * 2)
+            self.stdscr.attron(self._clr("track"))
+            for col in range(self.w):
+                self.stdscr.addstr(row, col, GROUND_CHAR, self._clr("track"))
+            self.stdscr.attroff(self._clr("track"))
+
+    def _draw_obstacles(self):
+        for o in self.track.obstacles:
+            col = int(o.x - self.camera_x)
+            if 0 <= col < self.w:
+                row = min(self.h - 3, 6 + o.lane * 2) - 1
+                if o.kind == ROCK:
+                    self.stdscr.addstr(row, col, ROCK_CHAR, self._clr("danger"))
+                elif o.kind == LOG:
+                    self.stdscr.addstr(row, col, LOG_CHAR, self._clr("hud"))
+                elif o.kind == RAMP:
+                    self.stdscr.addstr(row, col, RAMP_CHAR, self._clr("neon2"))
+
+    def _draw_racers(self):
+        for r in self.racers:
+            col = int(r.x - self.camera_x)
+            if 0 <= col < self.w:
+                base_row = min(self.h - 3, 6 + r.lane * 2)
+                row = base_row - (1 if r.y > 0.0 else 0) - int(min(2, r.y))
+                ch = BIKE_PLAYER if r.is_player else BIKE_BOT
+                color = "neon3" if r.is_player else "neon1"
+                self.stdscr.addstr(row, col, ch, self._clr(color))
+
+    def _draw_particles(self):
+        for p in self.particles:
+            col = int(p.x - self.camera_x)
+            if 0 <= col < self.w:
+                base_row = min(self.h - 3, 6 + (LANES // 2) * 2)
+                row = base_row - int(p.y)
+                if 0 <= row < self.h:
+                    self.stdscr.addstr(row, col, p.char, self._clr(p.color_key))
+
+    def _draw_hud(self):
+        # HUD line
+        player = self._player()
+        hud = [
+            f"Time: {self._fmt_time(self.time_race)}",
+            f"Speed: {player.vx:05.1f}",
+            f"Pos: {int(player.x):04d}/{TRACK_LENGTH}",
+            f"Engine: {'ON' if player.engine_on else 'OFF'}",
+            f"Motion: {'SMOOTH' if not self.reduced_motion else 'STEADY'}",
+            f"Bots: {self.bot_count}"
+        ]
+        hud_str = "  ".join(hud)
+        self.stdscr.attron(self._clr("hud"))
+        self._left_text(self.h - 2, hud_str)
+        self.stdscr.attroff(self._clr("hud"))
+
+        # Controls hint (minimal)
+        self.stdscr.attron(self._clr("ghost"))
+        self._left_text(self.h - 1, "S engine  D throttle  A brake  Space jump  P pause  R restart  H home  Q quit")
+        self.stdscr.attroff(self._clr("ghost"))
+
+    # Utility
+    def _player(self) -> Racer:
+        for r in self.racers:
+            if r.is_player:
+                return r
+        # fallback
+        return self.racers[0]
+
+    def _lerp(self, a: float, b: float, t: float) -> float:
+        return a + (b - a) * t
+
+    def _fmt_time(self, t: Optional[float]) -> str:
+        if t is None:
+            return "--"
+        return f"{t:0.2f}s"
+
+    def _center_text(self, row: int, text: str):
+        col = max(0, (self.w - len(text)) // 2)
+        if 0 <= row < self.h:
+            try:
+                self.stdscr.addstr(row, col, text)
+            except curses.error:
+                pass
+
+    def _left_text(self, row: int, text: str):
+        if 0 <= row < self.h:
+            try:
+                self.stdscr.addstr(row, 1, text)
+            except curses.error:
+                pass
+
+def main(stdscr):
+    game = Game(stdscr)
+    game.run()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    game = Game(root)
-    root.mainloop()
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
