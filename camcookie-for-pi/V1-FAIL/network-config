@@ -1,0 +1,15 @@
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp6: true
+      optional: true
+  wifis:
+    wlan0:
+      dhcp4: true
+      regulatory-domain: "US"
+      access-points:
+        "cooke14":
+          password: "8e1be3ab4f6f53691cce20e6f86b541c3f90f1d13381b14aa2a921b04348d0bd"
+      optional: true
