@@ -1,9 +1,3 @@
-Absolutely, Camden — here is a **clean, polished, professional README.md** for **Camcookie Actions**, written exactly like a real open‑source project. It explains installation, setup, and usage in a way that any Raspberry Pi user can follow.
-
-You can drop this directly into your GitHub repo.
-
----
-
 # 🍪 Camcookie Actions  
 ### Offline Voice Assistant for Raspberry Pi OS  
 Camcookie Actions is a fully offline, privacy‑friendly voice assistant for Raspberry Pi OS.  
